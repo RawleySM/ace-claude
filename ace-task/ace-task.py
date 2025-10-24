@@ -36,7 +36,6 @@ from claude_agent_sdk import (  # noqa: E402
     ClaudeAgentOptions,
     ClaudeSDKClient,
     HookContext,
-    HookEvent,
     HookInput,
     HookJSONOutput,
     HookMatcher,
@@ -300,7 +299,7 @@ async def build_task_client() -> tuple[ClaudeSDKClient, ClaudeAgentOptions]:
     return client, options
 
 
-def build_task_hooks() -> dict[HookEvent, list[HookMatcher]]:
+def build_task_hooks() -> dict[str, list[HookMatcher]]:
     async def detect_skill_need(
         input_data: HookInput, tool_use_id: str | None, context: HookContext
     ) -> HookJSONOutput:
@@ -321,9 +320,8 @@ def build_task_hooks() -> dict[HookEvent, list[HookMatcher]]:
         return {}
 
     return {
-        HookEvent.PreToolUse: [
-            HookMatcher(hook_fn=detect_skill_need, match_fn=lambda *_: True),
-            HookMatcher(hook_fn=log_task_progress, match_fn=lambda *_: True),
+        'PreToolUse': [
+            HookMatcher(matcher=None, hooks=[detect_skill_need, log_task_progress]),
         ]
     }
 

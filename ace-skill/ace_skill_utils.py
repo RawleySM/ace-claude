@@ -21,7 +21,6 @@ from claude_agent_sdk import (
     ClaudeAgentOptions,
     ClaudeSDKClient,
     HookContext,
-    HookEvent,
     HookInput,
     HookJSONOutput,
     HookMatcher,
@@ -361,7 +360,7 @@ def extract_tool_metrics(messages: list[Message]) -> dict[str, Any]:
     }
 
 
-def build_skill_reflector_hooks() -> dict[HookEvent, list[HookMatcher]]:
+def build_skill_reflector_hooks() -> dict[str, list[HookMatcher]]:
     """Construct the default hook set for the skill reflector."""
 
     async def validate_tool_input(
@@ -430,14 +429,14 @@ def build_skill_reflector_hooks() -> dict[HookEvent, list[HookMatcher]]:
         return {}
 
     return {
-        HookEvent.PreToolUse: [
-            HookMatcher(hook_fn=validate_tool_input, match_fn=lambda *_: True)
+        'PreToolUse': [
+            HookMatcher(matcher=None, hooks=[validate_tool_input])
         ],
-        HookEvent.PostToolUse: [
-            HookMatcher(hook_fn=capture_tool_result, match_fn=lambda *_: True)
+        'PostToolUse': [
+            HookMatcher(matcher=None, hooks=[capture_tool_result])
         ],
-        HookEvent.SubagentStop: [
-            HookMatcher(hook_fn=record_subagent_completion, match_fn=lambda *_: True)
+        'SubagentStop': [
+            HookMatcher(matcher=None, hooks=[record_subagent_completion])
         ],
     }
 
@@ -445,22 +444,22 @@ def build_skill_reflector_hooks() -> dict[HookEvent, list[HookMatcher]]:
 def build_custom_skill_hooks(
     validators: list[Callable[[HookInput, str | None, HookContext], Any]],
     reflectors: list[Callable[[HookInput, str | None, HookContext], Any]],
-) -> dict[HookEvent, list[HookMatcher]]:
+) -> dict[str, list[HookMatcher]]:
     """Create a hook configuration that layers custom logic onto defaults."""
 
-    matchers: dict[HookEvent, list[HookMatcher]] = {
-        HookEvent.PreToolUse: [],
-        HookEvent.PostToolUse: [],
+    matchers: dict[str, list[HookMatcher]] = {
+        'PreToolUse': [],
+        'PostToolUse': [],
     }
 
     for validator in validators:
-        matchers[HookEvent.PreToolUse].append(
-            HookMatcher(hook_fn=validator, match_fn=lambda *_: True)
+        matchers['PreToolUse'].append(
+            HookMatcher(matcher=None, hooks=[validator])
         )
 
     for reflector in reflectors:
-        matchers[HookEvent.PostToolUse].append(
-            HookMatcher(hook_fn=reflector, match_fn=lambda *_: True)
+        matchers['PostToolUse'].append(
+            HookMatcher(matcher=None, hooks=[reflector])
         )
 
     return matchers
