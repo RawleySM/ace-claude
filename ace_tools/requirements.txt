@@ -1,0 +1,10 @@
+# ACE Tools - Session Inspector Requirements
+# Install with: pip install -r requirements.txt or uv pip install -r requirements.txt
+
+# Core dependencies
+claude-agent-sdk>=0.1.4  # Claude Agent SDK for hook integration
+pydantic>=2.0.0          # Data validation and serialization
+textual>=0.40.0          # Terminal UI framework
+
+# Optional dependencies for enhanced features
+# python-dateutil>=2.8.0  # Advanced date parsing (already included with pydantic)
