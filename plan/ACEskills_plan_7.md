@@ -987,11 +987,17 @@ The specification binds every moving part to SDK primitives shown in the officia
                    msg.metadata = {}
                msg.metadata["loop_type"] = "task"
                msg.metadata["trajectory_id"] = trajectory.task_id
-               
+
                trajectory.append(msg)
-               
+
+               # Curator produces a structured summary for the decision node
+               curator_summary = task_curator.summarize_for_outer_loop(
+                   trajectory=trajectory,
+                   latest_message=msg,
+               )
+
                # Check if skill generation is needed
-               if should_invoke_skill_loop(msg, playbook):
+               if should_invoke_skill_loop(msg, playbook, curator_summary):
                    logger.info("Escalating to skill loop...")
                    skill_summary = await run_skill_sub_loop(
                        msg=msg,
@@ -1014,27 +1020,116 @@ The specification binds every moving part to SDK primitives shown in the officia
    ```
 
    ```python
-   def should_invoke_skill_loop(msg: Message, playbook: "DeltaPlaybook") -> bool:
+   def should_invoke_skill_loop(
+       msg: Message,
+       playbook: "DeltaPlaybook",
+       curator_summary: "TaskCuratorSummary",
+   ) -> bool:
        """
        Determine if a task message indicates need for skill generation.
-       
-       Criteria:
-       - AssistantMessage contains keywords like "reusable", "pattern", "skill"
-       - Multiple similar tool calls detected
-       - Explicit request for generalization
+
+       The Task Curator emits a structured summary (`TaskCuratorSummary`) that
+       aggregates:
+       - `proposed_updates_token_count`: running token cost of proposed Delta
+         Playbook updates that remain uncommitted.
+       - `pending_requests`: ordered list of curator-surfaced actions such as
+         "start_skill_loop" or "await_clarification".
+       - `duplicate_patterns`: normalized descriptors of repeated tool usage or
+         output shapes that suggest a reusable abstraction opportunity.
+       - `escalation_notes`: free-form curator reasoning and confidence scores.
+
+       Criteria combine curator signals with message content:
+       - Inner-loop trigger when `should_start_skill_inner_loop(curator_summary,
+         token_threshold=playbook.token_budget)` returns True.
+       - AssistantMessage contains keywords like "reusable", "pattern",
+         "skill", or "generalize".
+       - Multiple similar tool calls detected (from `duplicate_patterns`).
+       - Explicit request for generalization or curator action item.
        """
+       if should_start_skill_inner_loop(curator_summary, playbook.token_budget):
+           logger.info("Curator requested skill inner loop based on token budget")
+           return True
+
        if isinstance(msg, AssistantMessage):
            content = msg.content if isinstance(msg.content, str) else ""
            keywords = ["reusable", "pattern", "skill", "generalize", "template"]
-           
+
            for keyword in keywords:
                if keyword.lower() in content.lower():
                    logger.info(f"Skill keyword detected: {keyword}")
                    return True
-       
+
+       if curator_summary.duplicate_patterns:
+           logger.info("Curator detected duplicate patterns suggesting a skill")
+           return True
+
+       if "start_skill_loop" in curator_summary.pending_requests:
+           logger.info("Curator explicitly requested skill loop start")
+           return True
+
        # Could also check tool usage patterns, playbook state, etc.
        return False
+  ```
+
+   ```python
+   def should_start_skill_inner_loop(
+       curator_summary: "TaskCuratorSummary",
+       token_threshold: int,
+   ) -> bool:
+       """
+       Evaluate Task Curator signals before escalating into the skill inner loop.
+
+       Inputs:
+       - `curator_summary.proposed_updates_token_count`: integer token estimate
+         covering all draft Delta Playbook updates the Task Curator has staged.
+       - `curator_summary.pending_requests`: list capturing curator directives
+         (e.g., "start_skill_loop", "refine_delta", "needs_review").
+       - `curator_summary.escalation_notes`: contextual reasoning and
+         confidence, optionally containing `"inner_loop": {"confidence": 0.82}`
+         metadata.
+
+       Behavior:
+       - Return True immediately if `"start_skill_loop"` appears in
+         `pending_requests`.
+       - Otherwise compare `proposed_updates_token_count` against
+         `token_threshold` (sourced from the playbook budget). When the count
+         exceeds the threshold, the curator marks the skill inner loop as ready
+         so the outer loop can orchestrate generalization before tokens balloon.
+       - Optional: log escalation_notes for observability even when the result
+         is False.
+       """
+
+       if "start_skill_loop" in curator_summary.pending_requests:
+           return True
+
+       return (
+           curator_summary.proposed_updates_token_count >= token_threshold
+           and curator_summary.proposed_updates_token_count > 0
+       )
    ```
+
+   **Task Curator summary lifecycle**
+
+   1. **Aggregation** — After each streamed message, the Task Curator ingests the
+      refreshed `TaskTrajectory` and the latest assistant response to compute a
+      `TaskCuratorSummary`. The summary includes:
+      - `proposed_updates_token_count`: total Anthropic token estimate for
+        pending Delta Playbook drafts that have not been merged.
+      - `pending_requests`: prioritized directives (`start_skill_loop`,
+        `refine_delta`, `handoff_to_reflector`).
+      - `duplicate_patterns`: normalized strings describing repeated tool
+        behaviors or response formats, used to detect reusable abstractions.
+      - `escalation_notes`: optional reasoning blobs (JSON-serializable) that
+        capture curator rationale, confidence, and timestamps.
+   2. **Serialization** — The curator emits the summary as a structured payload
+      (dataclass instance or typed dict) on the TASK loop event bus. The outer
+      loop stores the latest snapshot in memory, tagged with the current
+      trajectory id for traceability.
+   3. **Decision node hand-off** — Prior to calling
+      `should_invoke_skill_loop(...)`, the outer loop injects the most recent
+      `TaskCuratorSummary` into the decision node (as shown above) so the helper
+      can combine curator metrics, playbook budgets, and message-level heuristics
+      before escalating into the skill inner loop.
 
    ```python
    async def run_skill_sub_loop(
