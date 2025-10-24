@@ -22,6 +22,20 @@ ace-skill/
     commands/
 ```
 
+An `ace-task/.mcp.json` entry launches the skill server over stdio and pins its working directory to the sibling project so its `.claude/` tree stays isolated:
+
+```
+{
+  "mcpServers": {
+    "ace-skills": {
+      "command": "uv",
+      "args": ["run", "ace-skill/ace-skill.py", "--serve"],
+      "cwd": "../ace-skill"
+    }
+  }
+}
+```
+
 Both programs must load subagent and slash-command assets from their local `.claude` folders at runtime so that Task runs can mount project-specific behaviors exactly as described in the [Subagents](https://docs.claude.com/en/api/agent-sdk/subagents) and [Slash Commands](https://docs.claude.com/en/api/agent-sdk/slash-commands) documentation.
 
 ## Claude-Agent-SDK touchpoints and documentation references
@@ -79,36 +93,7 @@ The specification binds every moving part to SDK primitives shown in the officia
   ```
   (`examples/setting_sources.py`, lines 73-99)
 
-- **External MCP server wrapping custom tools** – `ace-skill.py` uses the documented `create_sdk_mcp_server` factory and `tool` decorator to register a single typed MCP tool, mirroring the `customServer` pattern in the Custom Tools guide.【cdb1ed†L1-L31】
-  ```typescript
-  const customServer = createSdkMcpServer({
-    name: "my-custom-tools",
-    version: "1.0.0",
-    tools: [
-      tool(
-        "get_weather",
-        "Get current weather for a location",
-        {
-          location: z.string().describe("City name or coordinates"),
-          units: z.enum(["celsius", "fahrenheit"]).default("celsius").describe("Temperature units")
-        },
-        async (args) => {
-          const response = await fetch(
-            `https://api.weather.com/v1/current?q=${args.location}&units=${args.units}`
-          );
-          const data = await response.json();
-
-          return {
-            content: [{
-              type: "text",
-              text: `Temperature: ${data.temp}°\nConditions: ${data.conditions}\nHumidity: ${data.humidity}%`
-            }]
-          };
-        }
-      )
-    ]
-  });
-  ```
+- **External MCP server wrapping custom tools** – `ace-skill.py` mirrors the MCP guide’s `stdio-server` example: it boots a stdio transport server, registers `generate_skill` inside that process, and relies on `.mcp.json` to spawn `uv run ace-skill/ace-skill.py --serve` under the `ace-skills` namespace. The external server owns tool registration and communicates strictly over stdio so it can live in its own working directory with an isolated `.claude/` tree while the main TASK loop stays lightweight.
 - **Allowed tool gating for MCP** – `ace-task.py` whitelists the exported tool exactly as in the guide’s streaming example so the TASK loop remains small and generic:
   ```typescript
   for await (const message of query({
@@ -166,7 +151,7 @@ The specification binds every moving part to SDK primitives shown in the officia
 1. **Configuration loaders**
    - `load_subagents(root: Path) -> dict[str, AgentDefinition]`: parse `.claude/agents` files (JSON/YAML) into `AgentDefinition` objects.
    - `load_commands(root: Path) -> list[Path]`: enumerate `.claude/commands/*.md` for logging and validation; command bodies are executed by Claude Code via the SDK when `setting_sources` includes `"project"`.
-   - `load_mcp_servers(root: Path) -> dict[str, McpSdkServerConfig]`: register optional MCP servers (exposed via `create_sdk_mcp_server`) per documentation.
+   - `load_mcp_servers(root: Path) -> dict[str, McpSdkServerConfig]`: surface `.mcp.json` entries that spawn `uv run ace-skill/ace-skill.py --serve` via the stdio transport so each external tool server stays in its own project subtree and picks up the colocated `.claude/` assets.
 
 2. **Skill loop primitives**
    - `class SkillLoop`: wraps `ClaudeSDKClient` lifecycle for SKILL requests. Constructor accepts `ClaudeAgentOptions`, optional hooks, and Delta Playbook context. Methods:
@@ -177,13 +162,13 @@ The specification binds every moving part to SDK primitives shown in the officia
    - `summarize_skill_session(messages: list[Message]) -> dict`: collapse `ToolUseBlock`/`ToolResultBlock` pairs into structured delta items consumed by the Task Curator.
 
 4. **MCP server entrypoint**
-   - Provide `def main(argv: Sequence[str]) -> None` that parses `--serve`. When serving, it builds a `create_sdk_mcp_server` with the single `tool("generate_skill", ...)` and calls `server.run_stdio()` so the process can be launched via `.mcp.json`. When imported, `main` is not executed; instead, helper functions feed back into `ace-task`.
+   - Provide `def main(argv: Sequence[str]) -> None` that parses `--serve`. When serving, it initializes the SDK’s stdio transport server, registers `generate_skill` inside that process, and blocks on the stdio loop exactly like the MCP guide’s `stdio-server` example so `.mcp.json` can launch it as `uv run ace-skill/ace-skill.py --serve`. When imported, `main` is not executed; the helpers simply feed configuration back into `ace-task`.
 
 ### ace-task/ace-task.py (script)
 1. **Playbook-driven orchestration**
    - Bootstraps `ClaudeAgentOptions` with:
      - `.agents` from `ace_skill.load_subagents(Path(__file__).parent)`
-     - `.mcp_servers` from `ace_skill.load_mcp_servers(...)`
+     - `.mcp_servers` from `ace_skill.load_mcp_servers(...)`, preserving the `.mcp.json`-defined `cwd` so the stdio server runs inside `ace-skill/` with its own `.claude/` state
      - `.setting_sources=["project"]` so `.claude/commands` resolve per `examples/setting_sources.py`.
    - Registers hooks for reflection (e.g., permission gating) via `ace_skill.build_hooks()` returning `HookMatcher` maps similar to `examples/hooks.py`.
 
