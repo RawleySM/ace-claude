@@ -1,199 +1,346 @@
-# Spec: ACE Skills Sub-loop with Claude-Agent-SDK Single-File Scripts
+# Spec: ACE Skills Sub-loop with MCP Server Architecture
 
 ## Overview anchored to Figure 1
-The skills loop in Figure 1 adds a bidirectional Claude Code detour between the Task Generator, Skill Reflector, and Delta Playbook. We will realize that detour with two single-file uv-compatible Python scripts that lean directly on the Claude-Agent-SDK:
 
-- `ace-task/ace-task.py` – orchestrates the full TASK loop, imports `ace_skill` as a module to share configuration loaders and hook builders, streams trajectory state, reconciles delta playbook items, and brokers calls to an external MCP tool server.
-- `ace-skill/ace-skill.py` – provides those reusable helpers **and** doubles as a stdio MCP server process. When executed directly (`uv run ace-skill/ace-skill.py --serve`), it exposes a single typed tool (`generate_skill`) that implements the “Skill Generator → Skill Reflector” arc from the diagram.
+The skills loop in Figure 1 adds a bidirectional Claude Code detour between the Task Generator, Skill Reflector, and Delta Playbook. We realize that detour with two independent single-file uv-compatible Python scripts that communicate via the MCP protocol:
 
-Each script lives in its own project subtree with a `.claude` directory that matches the SDK’s documented layout, plus a project-scoped `.mcp.json` that binds the external server under the `ace-skills` namespace:
+- **`ace-task/ace-task.py`** – Orchestrates the full TASK loop, streams trajectory state, reconciles delta playbook items, and invokes the skill generation MCP tool when needed.
+- **`ace-skill/ace-skill.py`** – Runs as a standalone stdio MCP server that exposes a `generate_skill` tool. This server operates in its own process with its own `.claude/` directory context.
+
+## Architecture: Process Boundaries
+
+```
+┌─────────────────────────────────┐
+│   ace-task.py (Main Process)    │
+│   - Task loop orchestration     │
+│   - Uses ace-task/.claude/      │
+│   - Invokes MCP tool             │
+└────────────┬────────────────────┘
+             │ MCP Protocol (stdio)
+             │ Tool: mcp__ace-skills__generate_skill
+             ▼
+┌─────────────────────────────────┐
+│ ace-skill.py (MCP Server Process)│
+│ - Skill generation loop          │
+│ - Uses ace-skill/.claude/        │
+│ - Returns skill deltas           │
+└──────────────────────────────────┘
+```
+
+## Directory Structure
 
 ```
 ace-task/
-  ace-task.py
-  .mcp.json
+  ace-task.py              # Main orchestrator
+  .mcp.json                # MCP server configuration
   .claude/
     agents/
+      task-generator.md
+      task-curator.md
+      task-reflector.md
     commands/
+      review-playbook.md
+  playbook.json            # Delta playbook persistence
+
 ace-skill/
-  ace-skill.py
+  ace-skill.py             # MCP server (stdio)
   .claude/
     agents/
+      skill-generator.md
+      skill-curator.md
+      skill-reflector.md
     commands/
+      validate-skill.md
+  skills/                  # Generated skills library
 ```
 
-An `ace-task/.mcp.json` entry launches the skill server over stdio and pins its working directory to the sibling project so its `.claude/` tree stays isolated:
+## MCP Server Configuration
 
-```
+`ace-task/.mcp.json` spawns the skill server in its own directory:
+
+```json
 {
   "mcpServers": {
     "ace-skills": {
       "command": "uv",
-      "args": ["run", "ace-skill/ace-skill.py", "--serve"],
+      "args": ["run", "../ace-skill/ace-skill.py"],
       "cwd": "../ace-skill"
     }
   }
 }
 ```
 
-Both programs must load subagent and slash-command assets from their local `.claude` folders at runtime so that Task runs can mount project-specific behaviors exactly as described in the [Subagents](https://docs.claude.com/en/api/agent-sdk/subagents) and [Slash Commands](https://docs.claude.com/en/api/agent-sdk/slash-commands) documentation.
+This ensures:
+- `ace-skill.py` runs with `cwd=ace-skill/`
+- It loads agents from `ace-skill/.claude/agents/`
+- It loads commands from `ace-skill/.claude/commands/`
+- Process-level isolation between task and skill contexts
 
-## Claude-Agent-SDK touchpoints and documentation references
-The specification binds every moving part to SDK primitives shown in the official examples repository:
+## Claude-Agent-SDK Touchpoints
 
-- **Streaming TASK loop** – Use `ClaudeSDKClient` to maintain the bi-directional exchange in the TASK Query → TASK Trajectory path. The streaming helper is documented in `examples/streaming_mode.py`:
-  ```python
-  async with ClaudeSDKClient() as client:
-      print("User: What is 2+2?")
-      await client.query("What is 2+2?")
+### Task Loop (ace-task.py)
 
-      async for msg in client.receive_response():
-          display_message(msg)
-  ```
-  (`examples/streaming_mode.py`, lines 53-60)
+**Streaming TASK loop** – Use `ClaudeSDKClient` with MCP server configuration:
 
-- **Custom agent registry** – Load `.claude/agents/*.json|*.yaml` files into `AgentDefinition` objects passed through `ClaudeAgentOptions.agents`, matching `examples/agents.py`:
-  ```python
-  options = ClaudeAgentOptions(
-      agents={
-          "analyzer": AgentDefinition(
-              description="Analyzes code structure and patterns",
-              prompt="You are a code analyzer. Examine code structure, patterns, and architecture.",
-              tools=["Read", "Grep", "Glob"],
-          ),
-          "tester": AgentDefinition(
-              description="Creates and runs tests",
-              prompt="You are a testing expert. Write comprehensive tests and ensure code quality.",
-              tools=["Read", "Write", "Bash"],
-              model="sonnet",
-          ),
-      },
-      setting_sources=["user", "project"],
-  )
-  ```
-  (`examples/agents.py`, lines 84-101)
+```python
+# /// script
+# dependencies = ["claude-agent-sdk", "anyio"]
+# ///
 
-- **Slash command discovery** – Respect the `.claude/commands` directory and surfacing through `setting_sources`, demonstrated in `examples/setting_sources.py`:
-  ```python
-  options = ClaudeAgentOptions(
-      setting_sources=["user", "project"],
-      cwd=sdk_dir,
-  )
+from pathlib import Path
+from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions
 
-  async with ClaudeSDKClient(options=options) as client:
-      await client.query("What is 2 + 2?")
+task_root = Path(__file__).parent
 
-      async for msg in client.receive_response():
-          if isinstance(msg, SystemMessage) and msg.subtype == "init":
-              commands = extract_slash_commands(msg)
-              print(f"Available slash commands: {commands}")
-              if "commit" in commands:
-                  print("✓ /commit is available (expected)")
-              break
-  ```
-  (`examples/setting_sources.py`, lines 73-99)
+options = ClaudeAgentOptions(
+    setting_sources=["project"],
+    cwd=task_root,
+    # MCP server loaded from .mcp.json automatically
+)
 
-- **External MCP server wrapping custom tools** – `ace-skill.py` mirrors the MCP guide’s `stdio-server` example: it boots a stdio transport server, registers `generate_skill` inside that process, and relies on `.mcp.json` to spawn `uv run ace-skill/ace-skill.py --serve` under the `ace-skills` namespace. The external server owns tool registration and communicates strictly over stdio so it can live in its own working directory with an isolated `.claude/` tree while the main TASK loop stays lightweight.
-- **Allowed tool gating for MCP** – `ace-task.py` whitelists the exported tool exactly as in the guide’s streaming example so the TASK loop remains small and generic:
-  ```typescript
-  for await (const message of query({
-    prompt: "Calculate 5 + 3 and translate 'hello' to Spanish",
-    options: {
-      mcpServers: {
-        utilities: multiToolServer
-      },
-      allowedTools: [
-        "mcp__utilities__calculate",
-        "mcp__utilities__translate"
-      ]
-    }
-  })) {
-    // Process messages
+async with ClaudeSDKClient(options=options) as client:
+    await client.query("Generate authentication skill")
+
+    async for msg in client.receive_response():
+        # Process messages
+        display_message(msg)
+```
+
+**Invoking the skill tool** – Call the MCP tool with allowed tools gating:
+
+```python
+options = ClaudeAgentOptions(
+    setting_sources=["project"],
+    cwd=task_root,
+    allowedTools=["mcp__ace-skills__generate_skill"]
+)
+
+async with ClaudeSDKClient(options=options) as client:
+    # Claude can now invoke the generate_skill tool from the MCP server
+    await client.query(
+        "Generate a reusable skill for user authentication with JWT tokens"
+    )
+
+    async for msg in client.receive_response():
+        if isinstance(msg, ToolResultBlock):
+            # Extract skill deltas from tool result
+            skill_deltas = parse_skill_result(msg.content)
+            playbook.merge(skill_deltas)
+```
+
+### Skill MCP Server (ace-skill.py)
+
+**MCP server implementation** – Standalone stdio server with isolated `.claude/` context:
+
+```python
+# /// script
+# dependencies = ["claude-agent-sdk", "anyio", "mcp"]
+# ///
+
+import asyncio
+from pathlib import Path
+from mcp.server import Server
+from mcp.server.stdio import stdio_server
+from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions
+
+skill_root = Path(__file__).parent
+server = Server("ace-skills")
+
+@server.call_tool()
+async def generate_skill(
+    prompt: str,
+    playbook_context: dict | None = None
+) -> dict:
+    """
+    Generate a reusable skill from task requirements.
+
+    Args:
+        prompt: Description of skill to generate
+        playbook_context: Existing skills to avoid duplication
+
+    Returns:
+        Structured skill deltas including code, docs, and metadata
+    """
+    # Initialize SDK client with ace-skill/.claude/ directory
+    options = ClaudeAgentOptions(
+        setting_sources=["project"],
+        cwd=skill_root,
+    )
+
+    messages = []
+    async with ClaudeSDKClient(options=options) as client:
+        # Enrich prompt with playbook context
+        enriched_prompt = enrich_with_context(prompt, playbook_context)
+
+        await client.query(enriched_prompt)
+
+        async for msg in client.receive_response():
+            messages.append(msg)
+
+    # Extract skill deltas from message stream
+    return extract_skill_deltas(messages)
+
+
+async def main():
+    """Run MCP server on stdio."""
+    async with stdio_server() as (read_stream, write_stream):
+        await server.run(
+            read_stream,
+            write_stream,
+            server.create_initialization_options()
+        )
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+## Data Flow: Task → MCP Tool → Skill Deltas
+
+1. **Task Query** – User provides task to `ace-task.py`
+2. **Skill Need Detection** – Task loop determines skill generation is needed
+3. **MCP Tool Invocation** – Claude (via SDK) calls `mcp__ace-skills__generate_skill`
+4. **Server Execution** – `ace-skill.py` receives tool call, runs skill session with `ace-skill/.claude/` agents
+5. **Delta Extraction** – Server extracts structured deltas (code, docs, references)
+6. **Tool Result** – Server returns deltas as tool result
+7. **Playbook Merge** – Task loop validates and merges deltas into playbook
+8. **Continue Task** – Task loop continues with enriched context
+
+## Tool Interface: generate_skill
+
+**Input Schema:**
+```typescript
+{
+  prompt: string,              // Skill generation request
+  playbook_context?: {         // Optional context to avoid duplication
+    existing_skills: string[],
+    constraints: object[],
+    references: object[]
   }
-  ```
-  (`Custom Tools` docs)
+}
+```
 
-- **Hook instrumentation for the skill reflector** – Mirror Figure 1’s “Skill Reflector” node by installing SDK hooks via `ClaudeAgentOptions.hooks` the way `examples/hooks.py` blocks commands and annotates tool runs:
-  ```python
-  async def check_bash_command(
-      input_data: HookInput, tool_use_id: str | None, context: HookContext
-  ) -> HookJSONOutput:
-      """Prevent certain bash commands from being executed."""
-      tool_name = input_data["tool_name"]
-      tool_input = input_data["tool_input"]
+**Output Schema:**
+```typescript
+{
+  success: boolean,
+  skill_deltas: {
+    clarifications: string[],     // Questions raised during generation
+    references: string[],         // External docs discovered
+    runbook_snippets: {           // Generated code/config
+      code: string,
+      language: string,
+      description: string
+    }[],
+    reflection_notes: string[],   // Skill reflector insights
+    metadata: {
+      duration_seconds: number,
+      tool_calls: number,
+      agents_invoked: string[]
+    }
+  },
+  trajectory_id: string           // For debugging/inspection
+}
+```
 
-      if tool_name != "Bash":
-          return {}
+## Responsibilities
 
-      command = tool_input.get("command", "")
-      block_patterns = ["foo.sh"]
+### ace-task/ace-task.py (Task Orchestrator)
 
-      for pattern in block_patterns:
-          if pattern in command:
-              logger.warning(f"Blocked command: {command}")
-              return {
-                  "hookSpecificOutput": {
-                      "hookEventName": "PreToolUse",
-                      "permissionDecision": "deny",
-                      "permissionDecisionReason": f"Command contains invalid pattern: {pattern}",
-                  }
-              }
+1. **Task loop management**
+   - Load task agents from `ace-task/.claude/agents/`
+   - Stream task messages and build trajectory
+   - Detect when skill generation is needed
 
-      return {}
-  ```
-  (`examples/hooks.py`, lines 35-60)
+2. **MCP tool invocation**
+   - Call `mcp__ace-skills__generate_skill` with skill prompt
+   - Pass playbook context to avoid duplication
+   - Parse tool result for skill deltas
 
-- **Result aggregation** – Capture `AssistantMessage`, `ToolUseBlock`, `ToolResultBlock`, and `ResultMessage` instances in the TASK trajectory, aligning with the delta playbook overlays shown in the diagram and the `display_message` helpers in the SDK examples.
+3. **Playbook management**
+   - Validate skill deltas before merging
+   - Persist playbook to `playbook.json`
+   - Inject playbook context into subsequent tasks
 
-## Responsibilities and interactions
+4. **Trajectory export**
+   - Capture all messages (task + tool results)
+   - Export to JSONL for inspection
+   - Annotate with skill session metadata
 
-### ace-skill/ace-skill.py (module + stdio MCP server)
-1. **Configuration loaders**
-   - `load_subagents(root: Path) -> dict[str, AgentDefinition]`: parse `.claude/agents` files (JSON/YAML) into `AgentDefinition` objects.
-   - `load_commands(root: Path) -> list[Path]`: enumerate `.claude/commands/*.md` for logging and validation; command bodies are executed by Claude Code via the SDK when `setting_sources` includes `"project"`.
-   - `load_mcp_servers(root: Path) -> dict[str, McpSdkServerConfig]`: surface `.mcp.json` entries that spawn `uv run ace-skill/ace-skill.py --serve` via the stdio transport so each external tool server stays in its own project subtree and picks up the colocated `.claude/` assets.
+### ace-skill/ace-skill.py (Skill MCP Server)
 
-2. **Skill loop primitives**
-   - `class SkillLoop`: wraps `ClaudeSDKClient` lifecycle for SKILL requests. Constructor accepts `ClaudeAgentOptions`, optional hooks, and Delta Playbook context. Methods:
-     - `async def run_skill_session(self, prompt: str, trajectory_id: str) -> AsyncIterator[Message]`: streams messages, yields `Message` instances for the TASK loop to record, and forwards tool hooks to the reflector step.
-     - `async def invoke_tools(...)`: optional helper to call `client.query` on behalf of `ace-task` when the diagram’s Skill Generator is invoked.
+1. **MCP server lifecycle**
+   - Run as stdio server process
+   - Register `generate_skill` tool
+   - Handle tool invocations independently
 
-3. **Delta extraction helpers**
-   - `summarize_skill_session(messages: list[Message]) -> dict`: collapse `ToolUseBlock`/`ToolResultBlock` pairs into structured delta items consumed by the Task Curator.
+2. **Skill generation session**
+   - Create `ClaudeSDKClient` with `ace-skill/.claude/` context
+   - Run skill generation with skill agents
+   - Stream messages and extract deltas
 
-4. **MCP server entrypoint**
-   - Provide `def main(argv: Sequence[str]) -> None` that parses `--serve`. When serving, it initializes the SDK’s stdio transport server, registers `generate_skill` inside that process, and blocks on the stdio loop exactly like the MCP guide’s `stdio-server` example so `.mcp.json` can launch it as `uv run ace-skill/ace-skill.py --serve`. When imported, `main` is not executed; the helpers simply feed configuration back into `ace-task`.
+3. **Delta extraction**
+   - Parse messages for clarifications, references, code
+   - Apply skill reflector validation
+   - Structure output for playbook consumption
 
-### ace-task/ace-task.py (script)
-1. **Playbook-driven orchestration**
-   - Bootstraps `ClaudeAgentOptions` with:
-     - `.agents` from `ace_skill.load_subagents(Path(__file__).parent)`
-     - `.mcp_servers` from `ace_skill.load_mcp_servers(...)`, preserving the `.mcp.json`-defined `cwd` so the stdio server runs inside `ace-skill/` with its own `.claude/` state
-     - `.setting_sources=["project"]` so `.claude/commands` resolve per `examples/setting_sources.py`.
-   - Registers hooks for reflection (e.g., permission gating) via `ace_skill.build_hooks()` returning `HookMatcher` maps similar to `examples/hooks.py`.
+4. **Isolation**
+   - No imports from `ace-task`
+   - No shared state
+   - Pure stdio communication
 
-2. **TASK loop alignment**
-   - `async def run_task(task_prompt: str)`: enters `SkillLoop.run_skill_session`, consumes messages, appends them to ACE’s TASK trajectory log, and feeds them into the “Skill Reflector” sub-loop from Figure 1.
-   - Integrates delta output with the Playbook store: accepted deltas update the Delta Playbook Items component shown in the diagram.
-   - Keeps in-process tools intentionally small (e.g., default SDK `Read`, `Bash`, tracing hooks) and escalates to the external MCP tool only when the task requires new or updated skills. The code enforces this by setting `allowedTools=["mcp__ace-skills__generate_skill"]` during those escalations, mirroring the Custom Tools example.【cdb1ed†L32-L59】
+## Agent Definitions
 
-3. **Slash-command echoing**
-   - After each session, call `client.get_server_info()` to enumerate `commands` and annotate the trajectory with available slash commands. This is required so the “SKILL Insights” bubble in Figure 1 always reflects local `.claude/commands` state.
+### Task Agents (ace-task/.claude/agents/)
 
-4. **Skill inspector hand-off**
-   - Provide CLI arguments for exporting transcripts (JSONL) that include `Message.model_dump()` payloads for later inspection, matching the diagram’s “Content Playbook” and “Delta Playbook” reconciliation needs.
+**task-generator.md** – Decomposes tasks, identifies skill generation needs
+**task-curator.md** – Manages execution flow and playbook
+**task-reflector.md** – Validates outcomes and quality
 
-## Data flow derived from Figure 1
-1. **Task Query** – `run_task()` receives a task stub, composes a SKILL prompt (task prompt + playbook context), and initializes `SkillLoop` with generator metadata.
-2. **Skill Generator/Reflector** – `SkillLoop` streams messages and triggers hook callbacks. Hook decisions (allow/deny) become Skill Reflector output in the diagram.
-3. **Skill Insights** – `summarize_skill_session` emits structured deltas: clarifications, references, and runbooks. These align with the Delta Playbook Items in Figure 1.
-4. **Delta Feedback** – `ace-task.py` persists accepted deltas back into the Playbook store and optionally updates context summary before the next TASK iteration.
-5. **Trajectory Logging** – Both scripts write transcripts capturing `AssistantMessage`, `ToolUseBlock`, and `ResultMessage` records that the diagram labels “TASK Trajectory” and “SKILL Trajectory.”
+### Skill Agents (ace-skill/.claude/agents/)
 
-## Implementation considerations
-- **uv single-file constraint** – Both Python scripts must run as standalone uv entry points; keep dependencies limited to Claude-Agent-SDK, anyio, and stdlib modules.
-- **Configuration precedence** – When both `.claude` directories exist, `ace-task.py` should treat its local assets as the canonical set, while `ace-skill.py` acts as a module that can be reused elsewhere.
-- **Extensibility** – Hooks should capture `HookEvent.SubagentStop` for subagent tracing and `HookEvent.ToolStart/ToolFinish` for tool metrics, aligning with Figure 1’s Skill Reflector loop.
-- **Testing** – Provide dry-run mode that instantiates `SkillLoop` with a fake `Transport` (see `ClaudeSDKClient` constructor) so unit tests can simulate trajectories without hitting the live CLI.
+**skill-generator.md** – Creates reusable patterns from requirements
+**skill-curator.md** – Organizes skills into coherent library
+**skill-reflector.md** – Validates skill quality and reusability
 
-This spec grounds every step of the ACE skills detour in the officially documented Claude-Agent-SDK constructs while respecting the diagram’s architecture and the requirement for directory-scoped subagents and slash commands.
+## Implementation Considerations
+
+**Process isolation benefits:**
+- Hard separation between task and skill contexts
+- Independent `.claude/` directory resolution
+- No risk of agent/command conflicts
+- Server can be restarted without affecting task loop
+
+**Process isolation costs:**
+- More complex deployment (two processes)
+- Stdio communication overhead
+- Harder to debug across process boundary
+- Cannot share Python objects directly
+
+**Testing:**
+- Mock MCP tool results for unit tests
+- Use test fixtures for skill deltas
+- Validate tool schema compliance
+- Test server startup/shutdown
+
+**Error handling:**
+- Task loop must handle MCP server failures
+- Server should return structured errors in tool results
+- Implement timeout for long-running skill sessions
+- Log stdio communication for debugging
+
+## Alignment with Figure 1
+
+- **Task Generator** → `ace-task.py` with task-generator agent
+- **Skill Generator** → `ace-skill.py` generate_skill tool with skill-generator agent
+- **Task Curator** → Task loop playbook management with task-curator agent
+- **Skill Curator** → Skill server delta extraction with skill-curator agent
+- **Task Reflector** → Task validation with task-reflector agent
+- **Skill Reflector** → Skill validation inside server with skill-reflector agent
+- **Skill Insights** → Tool result deltas
+- **Delta Playbook Items** → Playbook merge in task loop
+- **TASK Trajectory** → Task loop message stream
+- **SKILL Trajectory** → Skill server message stream (returned in tool result metadata)
+- **Bidirectional flow** → MCP tool call (task→skill) + tool result (skill→task)
+
+This pure MCP server architecture provides maximum isolation and clean separation of concerns at the cost of process management complexity.
