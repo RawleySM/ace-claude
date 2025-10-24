@@ -22,30 +22,7 @@ ace-skill/
     commands/
 ```
 
-Both programs must load subagent and slash-command assets from their local `.claude` folders at runtime so that Task runs can mount project-specific behaviors exactly as described in the [Subagents](https://docs.claude.com/en/api/agent-sdk/subagents) and [Slash Commands](https://docs.claude.com/en/api/agent-sdk/slash-commands) documentation. The `.mcp.json` co-located with `ace-task.py` wires the stdio process per the [MCP guide](https://docs.claude.com/en/api/agent-sdk/mcp), e.g.:
-
-```json
-{
-  "mcpServers": {
-    "ace-skills": {
-      "command": "uv",
-      "args": [
-        "run",
-        "--directory",
-        "../ace-skill",
-        "python",
-        "ace-skill.py",
-        "--serve"
-      ],
-      "env": {
-        "ACE_SKILL_CWD": "${PROJECT_ROOT}/ace-skill"
-      }
-    }
-  }
-}
-```
-
-The documented `.mcp.json` examples show the same shape for stdio servers (`command`, `args`, optional `env`) and are the baseline we follow.【a352b1†L1-L45】【a352b1†L61-L95】
+Both programs must load subagent and slash-command assets from their local `.claude` folders at runtime so that Task runs can mount project-specific behaviors exactly as described in the [Subagents](https://docs.claude.com/en/api/agent-sdk/subagents) and [Slash Commands](https://docs.claude.com/en/api/agent-sdk/slash-commands) documentation.
 
 ## Claude-Agent-SDK touchpoints and documentation references
 The specification binds every moving part to SDK primitives shown in the official examples repository:
