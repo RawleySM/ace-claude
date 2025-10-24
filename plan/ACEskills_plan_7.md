@@ -86,6 +86,33 @@ You are a task curator. Organize task execution, track progress, manage dependen
 sonnet
 ```
 
+#### Task Curator JSON payload schema
+
+The Task Curator emits a structured JSON payload after every planning cycle so the rest of the loop can react deterministically. The payload is serialized as a single JSON object with the following shape:
+
+```json
+{
+  "summary": "string",
+  "proposed_updates": [
+    {
+      "id": "string",
+      "description": "string",
+      "target": "string",
+      "priority": "low|medium|high"
+    }
+  ],
+  "python_helpers": ["string"],
+  "reference_requests": ["string"]
+}
+```
+
+- `summary` *(string, required)* — One-sentence recap of the curator's latest decisions that the Task Generator uses to keep the global trajectory synchronized.
+- `proposed_updates` *(array of objects, optional; defaults to `[]`)* — Zero or more granular updates that describe delta playbook merges, task reprioritizations, or dependency tweaks. Each entry must include an `id` (stable identifier), `description` (freeform text), `target` (path, task identifier, or skill name), and `priority` (enumerated `low`, `medium`, or `high`).
+- `python_helpers` *(array of strings, optional; defaults to `[]`)* — Names of helper functions or scripts the Task Curator wants the Skill loop to (re)generate. Non-empty lists cause the Skill Node orchestration function to launch the skill-generation detour immediately so the helpers are synthesized before the next task step.
+- `reference_requests` *(array of strings, optional; defaults to `[]`)* — Citations, specs, or external resources that must be fetched. When populated, the Skill Node bypasses the normal task flow and opens the reference-acquisition path so downstream agents receive the requested artifacts.
+
+The Task Curator writes this JSON object to the task trajectory stream (and makes it available via the in-process message bus) at the end of each curation pass. The Skill Node function consumes the object, inspects `python_helpers` and `reference_requests`, and automatically decides whether to initiate the skill sub-loop or the reference retrieval flow. If both lists are empty, the Task Node continues the main execution path using the `summary` and any `proposed_updates` to adjust its plan without triggering auxiliary loops.
+
 **task-reflector.md**
 ```markdown
 # Task Reflector
